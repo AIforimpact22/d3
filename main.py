@@ -36,7 +36,7 @@ def index():
 STOPWORDS = set("""
 a an and the to for of with into from by our your their his her its on in over under at as is are be been were was do does did
 then next after before finally also so that which who whom whose this those these it they we you i
-system app module service ai agent process workflow step task stage phase item node data info information
+system app module service ai agent process workflow task stage phase item node data info information
 """.split())
 
 GROUP_KEYWORDS = [
@@ -54,14 +54,19 @@ def _sentences(prompt: str):
     return [p.strip() for p in parts if p and p.strip()]
 
 def _clean_words(s: str):
-    words = re.split(r"[^A-Za-z0-9_]+", s.lower())
-    return [w for w in words if w and w not in STOPWORDS]
+    """
+    Keep alnum/underscore tokens, drop stopwords, and IGNORE numeric-only tokens.
+    Ensures every token has at least one alphabetic character.
+    """
+    raw = re.split(r"[^A-Za-z0-9_]+", s.lower())
+    return [w for w in raw if w and (w not in STOPWORDS) and re.search(r"[a-z]", w)]
 
 def _pascal_from_words(words, cap=6):
     if not words: return "Step"
     picked = words[:cap]
     pascal = "".join(w[:1].upper() + w[1:] for w in picked)
-    if not re.match(r"^[A-Za-z]", pascal): pascal = "Step" + pascal
+    if not re.match(r"^[A-Za-z]", pascal):  # extra guard
+        pascal = "Step" + pascal
     return pascal
 
 def _guess_group(text: str):
@@ -90,34 +95,32 @@ def _local_nodes_from_prompt(prompt: str):
     nodes, seen = [], set()
     for s in sents:
         words = _clean_words(s)
-        if not words: continue
+        # skip sentences that yield no alphabetic tokens
+        if not words:
+            continue
         step = _pascal_from_words(words, cap=6)
+        # avoid generic "Step" (can happen if words filtered out)
+        if step.lower() == "step":
+            continue
         group = _guess_group(s)
         dotted = f"method.{group}.{step}"
-        if dotted in seen: continue
+        if dotted in seen:
+            continue
         seen.add(dotted)
         nodes.append({"name": dotted, "size": _stable_size(dotted), "imports": []})
 
-    if len(nodes) < 4:
-        words = [w for w in _clean_words(prompt) if w not in STOPWORDS]
-        i = 1
-        while len(nodes) < 4 and i < len(words):
-            step = _pascal_from_words([words[i]])
-            dotted = f"method.flow.{step}"
-            if dotted not in seen:
-                nodes.append({"name": dotted, "size": _stable_size(dotted), "imports": []})
-                seen.add(dotted)
-            i += 1
+    # NOTE: Removed numeric-driven padding to prevent extras like Step350/Step500/etc.
+    # We do NOT fabricate extra nodes anymore. We only connect what the prompt produced.
 
     # Arrow hints A -> B : edge from A to B
     arrow_pairs = _extract_arrow_edges(prompt)
-    if arrow_pairs:
+    if arrow_pairs and nodes:
         def fuzzy_find(txt):
             tw = _clean_words(txt)
             if not tw: return None
-            needle = tw[0]
+            needle = re.escape(tw[0])
             for n in nodes:
-                if re.search(rf"{re.escape(needle)}", n["name"], re.IGNORECASE):
+                if re.search(needle, n["name"], re.IGNORECASE):
                     return n["name"]
             return None
         for a_txt, b_txt in arrow_pairs:
@@ -127,19 +130,20 @@ def _local_nodes_from_prompt(prompt: str):
                     if n["name"] == a and b not in n["imports"]:
                         n["imports"].append(b)
 
-    # Ensure at least some edges for visible curves
+    # Ensure at least some edges for visible curves when possible
     if sum(len(n["imports"]) for n in nodes) == 0 and len(nodes) >= 2:
         for i in range(1, len(nodes)):
             prev = nodes[i - 1]["name"]
             if prev not in nodes[i]["imports"]:
                 nodes[i]["imports"].append(prev)
 
-    # Scrub
+    # Scrub to valid dotted names and non-dangling imports
     dotted_ok = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
     names = {n["name"] for n in nodes if dotted_ok.match(n["name"])}
     out = []
     for n in nodes:
-        if n["name"] not in names: continue
+        if n["name"] not in names:
+            continue
         n["imports"] = [i for i in dict.fromkeys(n.get("imports", [])) if i in names and i != n["name"]]
         out.append(n)
     return out
@@ -188,6 +192,7 @@ def _coerce_and_validate_nodes(nodes):
     names = {n["name"] for n in out}
     for n in out:
         n["imports"] = [i for i in n["imports"] if i in names and i != n["name"]]
+    # Keep the "chain" fallback only if there are at least 2 nodes and no imports
     if sum(len(n["imports"]) for n in out) == 0 and len(out) >= 2:
         for i in range(1, len(out)):
             prev = out[i - 1]["name"]

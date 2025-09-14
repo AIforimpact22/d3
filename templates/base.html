@@ -46,6 +46,8 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
           <label><input type="radio" name="mode" value="ai" {% if not ai_available %}disabled{% endif %}> AI (Chat Completions)</label>
         </fieldset>
         <button id="generateBtn">Generate (Ctrl/Cmd+Enter)</button>
+        <button id="animateBtn"  title="Animate logically from sources">Animate</button>
+        <button id="recordBtn"   title="Record the animation to a video file">Save Video</button>
         <a id="downloadSvg" class="btn" href="#" download="workflow.svg">Download SVG</a>
         <span id="status" class="hint"></span>
       </div>
@@ -66,9 +68,11 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
     const chartHost = d3.select('#chart');
     const errorBox = document.getElementById('error');
     const generateBtn = document.getElementById('generateBtn');
-    const promptEl = document.getElementById('prompt');
+    const animateBtn  = document.getElementById('animateBtn');
+    const recordBtn   = document.getElementById('recordBtn');
+    const promptEl    = document.getElementById('prompt');
     const downloadSvg = document.getElementById('downloadSvg');
-    const statusEl = document.getElementById('status');
+    const statusEl    = document.getElementById('status');
 
     function showError(msg){ errorBox.style.display='block'; errorBox.textContent=msg; }
     function clearError(){ errorBox.style.display='none'; errorBox.textContent=''; }
@@ -143,19 +147,18 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
 
     // Color ramp with **equal thirds by length** for each path
     function rampColorEqualThirds(u, orient){
-      // u in [0,1] is the normalized **geometric** position along the edge
       if(orient === "r2b"){            // red → white → blue
-        if(u < 1/3)   return r2w(u * 3);           // 0..1/3 red→white
-        if(u < 2/3)   return WHITE;                 // 1/3..2/3 pure white
-        return w2b((u - 2/3) * 3);                  // 2/3..1 white→blue
+        if(u < 1/3)   return r2w(u * 3);
+        if(u < 2/3)   return WHITE;
+        return w2b((u - 2/3) * 3);
       } else {                          // blue → white → red
-        if(u < 1/3)   return b2w(u * 3);           // 0..1/3 blue→white
-        if(u < 2/3)   return WHITE;                 // 1/3..2/3 pure white
-        return w2r((u - 2/3) * 3);                  // 2/3..1 white→red
+        if(u < 1/3)   return b2w(u * 3);
+        if(u < 2/3)   return WHITE;
+        return w2r((u - 2/3) * 3);
       }
     }
 
-    // --- geometry helpers to get **length-weighted** color positions ---
+    // --- geometry helpers (length-weighted color positions) ---
     function dist(a,b){ const dx=a[0]-b[0], dy=a[1]-b[1]; return Math.hypot(dx,dy); }
     function bezierPoint(curve, t){
       const a=curve.a, b=curve.b, c=curve.c, d=curve.d;
@@ -175,13 +178,103 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
       return len;
     }
     function pathLength(path){
-      // path._ is an array of primitives: Line or BezierCurve
       return path._.reduce((acc, seg) => {
         if (seg instanceof Line) return acc + dist(seg.a, seg.b);
-        // Bezier approximation
         return acc + bezierLength(seg);
       }, 0);
     }
+
+    // ---- orientation helpers (ensure path draws from source → target) ----
+    function radialToXY(angle, r){
+      // match d3.lineRadial orientation (rotate -90°)
+      return [r * Math.cos(angle - Math.PI/2), r * Math.sin(angle - Math.PI/2)];
+    }
+    function pathStartPoint(p){
+      if(!p._ || !p._[0]) return [0,0];
+      const first = p._[0];
+      return first.a; // both Line and BezierCurve have .a as start point
+    }
+    function shouldReversePath(p, srcLeaf, dstLeaf){
+      const start = pathStartPoint(p);
+      const srcXY = radialToXY(srcLeaf.x, srcLeaf.y);
+      const dstXY = radialToXY(dstLeaf.x, dstLeaf.y);
+      // if the path starts closer to the target than the source, reverse it
+      return dist(start, srcXY) > dist(start, dstXY);
+    }
+    function reversePrimitive(seg){
+      if (seg instanceof Line)        return new Line(seg.b, seg.a);
+      /* BezierCurve */               return new BezierCurve(seg.d, seg.c, seg.b, seg.a);
+    }
+    function reverseWholePath(p){
+      const q = new Path();
+      q._ = p._.slice().reverse().map(reversePrimitive);
+      return q;
+    }
+
+    // --------- logical layering (Kahn-style) ----------
+    function computeNodeLevels(leaves){
+      const name = (d) => id(d);
+      const ids = leaves.map(name);
+      const idx = new Map(ids.map((v,i)=>[v,i]));
+      const out = new Map(ids.map(v=>[v,[]]));
+      const indeg = new Map(ids.map(v=>[v,0]));
+
+      leaves.forEach(d => {
+        const u = name(d);
+        (d.outgoing||[]).forEach(([src, tgt])=>{
+          const v = name(tgt);
+          if (!idx.has(v)) return;
+          out.get(u).push(v);
+          indeg.set(v, (indeg.get(v)||0)+1);
+        });
+      });
+
+      let current = ids.filter(v => indeg.get(v)===0 && (out.get(v)||[]).length>0);
+      if (current.length===0){
+        let minIn = Infinity;
+        ids.forEach(v => { minIn = Math.min(minIn, indeg.get(v)); });
+        current = ids.filter(v => indeg.get(v)===minIn);
+      }
+
+      const level = new Map();
+      let L = 0;
+      const indegWork = new Map(indeg);
+      const visited = new Set();
+
+      while (current.length){
+        const next = [];
+        current.forEach(v=>{
+          if (!visited.has(v)){
+            level.set(v, L);
+            visited.add(v);
+            (out.get(v)||[]).forEach(w=>{
+              indegWork.set(w, (indegWork.get(w)||0)-1);
+            });
+          }
+        });
+        const nxt = ids.filter(v=>!visited.has(v) && (out.get(v)||[]).length>0 && (indegWork.get(v)||0)===0);
+        if (nxt.length===0){
+          const remaining = ids.filter(v=>!visited.has(v) && ((out.get(v)||[]).length>0 || indeg.get(v)>0));
+          if (remaining.length===0) break;
+          let minIn = Infinity;
+          remaining.forEach(v=>{ minIn = Math.min(minIn, indegWork.get(v) ?? indeg.get(v)); });
+          current = remaining.filter(v=> (indegWork.get(v) ?? indeg.get(v)) === minIn);
+        } else {
+          current = nxt;
+        }
+        L++;
+      }
+
+      ids.forEach(v=>{ if(!level.has(v)) level.set(v, 0); });
+      return level;
+    }
+
+    // Keep references for animation/recording
+    let __svgSel = null;         // d3 selection of the SVG
+    let __brandSel = null;       // brand group to keep on top
+    let __segGroupStatic = null; // static segments group
+    let __segmentData = null;    // computed segment data for animation
+    let __levels = null;         // Map edgeId -> level number
 
     // ---------- render chart ----------
     function renderChart(raw){
@@ -189,7 +282,7 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
         clearError(); chartHost.selectAll("*").remove();
 
         const data = normalize(raw);
-        const width=900, radius=width/2.5, k=6; // split depth
+        const width=900, radius=width/2.5, k=6;
 
         const tree=d3.cluster().size([2*Math.PI, radius-100]);
         const root=tree(bilink(d3.hierarchy(data).sort((a,b)=>
@@ -200,6 +293,7 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
           .attr("width",width).attr("height",width)
           .attr("viewBox",[-width/2,-width/2,width,width])
           .attr("style","max-width:100%; height:auto; font:16px sans-serif;");
+        __svgSel = svg;
 
         // Background
         svg.append("rect")
@@ -222,47 +316,68 @@ Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast d
 ${(d.outgoing||[]).length} outgoing
 ${(d.incoming||[]).length} incoming`));
 
+        const leaves = root.leaves();
+        const levelByNode = computeNodeLevels(leaves);
+
         const line=d3.lineRadial().curve(d3.curveBundle).radius(d=>d.y).angle(d=>d.x);
         const toPath=([source,target])=>{const p=new Path; line.context(p)(source.path(target)); return p;};
+        const name = (d)=> id(d);
 
-        // Build per-edge segments; color by **geometric position** along the path
+        // Build per-edge segments; ensure geometry is oriented source->target
         const segmentData = [];
-        root.leaves().forEach(srcLeaf => {
+        const edgeLevel = new Map();
+        let edgeCounter = 0;
+
+        leaves.forEach(srcLeaf => {
           (srcLeaf.outgoing || []).forEach(pair => {
             const [src, dst] = pair;
             const orient = (nodeRole(src) === "start") ? "r2b" : "b2r";
-            const p = toPath([src, dst]);
+            let p = toPath([src, dst]);
 
-            // Split into many small segments and compute cumulative length
-            const segs = Array.from(p.split(k));  // 2^k small chunks
+            // Detect and correct reversed path geometry
+            if (shouldReversePath(p, src, dst)) {
+              p = reverseWholePath(p);
+            }
+
+            const segs = Array.from(p.split(k));
             const lengths = segs.map(s => pathLength(s));
             const total = lengths.reduce((a,b)=>a+b, 0) || 1;
             let cumulative = 0;
 
+            const L = levelByNode.get(name(src)) ?? 0;
+            edgeLevel.set(edgeCounter, L);
+
             for (let j = 0; j < segs.length; j++) {
               const segLen = lengths[j];
-              // use the segment's midpoint position along the whole path
-              const mid = (cumulative + segLen / 2) / total;   // u in [0,1]
+              const mid = (cumulative + segLen / 2) / total; // u in [0,1] along source->target
               cumulative += segLen;
-              segmentData.push({ seg: segs[j], u: mid, orient });
+              segmentData.push({ edge: edgeCounter, idx: j, level: L, seg: segs[j], u: mid, orient });
             }
+            edgeCounter++;
           });
         });
 
-        svg.append("g").attr("fill","none").selectAll("path")
+        __segmentData = segmentData;
+        __levels = edgeLevel;
+
+        // --- STATIC group (full chart)
+        __segGroupStatic = svg.append("g").attr("id","segGroupStatic").attr("fill","none");
+        __segGroupStatic.selectAll("path")
           .data(segmentData)
           .join("path")
+            .attr("class", "edge-segment")
             .attr("stroke", d => rampColorEqualThirds(d.u, d.orient))
-            .attr("stroke-width", 2)           <!-- thicker line -->
+            .attr("stroke-width", 2)  /* canonical thickness */
             .attr("stroke-linecap", "round")
             .attr("stroke-linejoin", "round")
             .attr("d", d => d.seg.toString());
 
-        // Brand (bottom-right)
+        // Brand (bottom-right) — keep on top
         const brand = svg.append("g").attr("transform", `translate(${width/2 - 150}, ${width/2 - 40})`);
         brand.append("image").attr("href","{{ brand_logo_url }}").attr("width",30).attr("height",30).attr("y",-20);
         brand.append("text").attr("x",40).attr("y",-5).attr("fill","white").style("font-weight","bold").text("{{ brand_name }}");
         brand.append("text").attr("x",40).attr("y",15).attr("fill","white").style("font-size","12px").text("{{ brand_site }}");
+        __brandSel = brand;
 
         chartHost.node().appendChild(svg.node());
 
@@ -277,6 +392,161 @@ ${(d.incoming||[]).length} incoming`));
       }
     }
 
+    // ---------- animation helpers ----------
+    function animateSegment(el, duration){
+      return new Promise(resolve => {
+        const len = el.getTotalLength();
+        d3.select(el)
+          .interrupt()
+          .style("stroke-opacity", 1)               // only visible when starting
+          .style("stroke-dasharray", `${len} ${len}`)
+          .style("stroke-dashoffset", `${len}`)
+          .transition()
+          .duration(duration)
+          .ease(d3.easeLinear)
+          .style("stroke-dashoffset", 0)            // draws from path start → end
+          .on("end", resolve);
+      });
+    }
+    async function animateEdge(edgeElems, edgeDuration=1200){
+      const lens = edgeElems.map(e => e.getTotalLength());
+      const total = lens.reduce((a,b)=>a+b,0) || 1;
+      for(let i=0;i<edgeElems.length;i++){
+        const segDur = Math.max(40, edgeDuration * (lens[i]/total));
+        await animateSegment(edgeElems[i], segDur);
+      }
+    }
+
+    // ---------- LOGICAL animation (level-by-level) ----------
+    async function animateChart(){
+      if(!__svgSel || !__segmentData || !__levels) return;
+      try{
+        animateBtn.disabled = true;
+        statusEl.textContent = "Animating…";
+
+        // Remove static group so nothing remains visible (prevents stray dots)
+        if(__segGroupStatic){ __segGroupStatic.remove(); __segGroupStatic = null; }
+
+        // Remove previous animation layer if any
+        const oldAnim = __svgSel.select("#segGroupAnim");
+        if(!oldAnim.empty()) oldAnim.remove();
+
+        // Build fresh animation group; segments start invisible
+        const gAnim = __svgSel.append("g").attr("id","segGroupAnim").attr("fill","none");
+        const nodes = gAnim.selectAll("path")
+          .data(__segmentData)
+          .join("path")
+            .attr("class","edge-segment anim")
+            .attr("data-edge", d => d.edge)
+            .attr("data-index", d => d.idx)
+            .attr("data-level", d => d.level)
+            .style("stroke-opacity", 0)
+            .attr("stroke", d => rampColorEqualThirds(d.u, d.orient))
+            .attr("stroke-width", 2)
+            .attr("stroke-linecap", "round")
+            .attr("stroke-linejoin", "round")
+            .attr("d", d => d.seg.toString())
+            .nodes();
+
+        // Keep brand watermark on top
+        if(__brandSel) __brandSel.raise();
+
+        // Group segment DOM nodes by edge id
+        const byEdge = new Map();
+        nodes.forEach(el => {
+          const d = d3.select(el).datum();
+          const k = d.edge;
+          if(!byEdge.has(k)) byEdge.set(k, []);
+          byEdge.get(k).push(el);
+        });
+        byEdge.forEach(arr => arr.sort((a,b) => {
+          const da = d3.select(a).datum(), db = d3.select(b).datum();
+          return d3.ascending(da.idx, db.idx);
+        }));
+
+        // Group edges by **level**
+        const levels = new Map(); // level -> array of edge arrays (DOM nodes per edge)
+        byEdge.forEach((segNodes, edgeId) => {
+          const L = __levels.get(edgeId) ?? 0;
+          if(!levels.has(L)) levels.set(L, []);
+          levels.get(L).push(segNodes);
+        });
+
+        // Animate level-by-level: all edges of a level concurrently
+        const sortedLevels = Array.from(levels.keys()).sort((a,b)=>a-b);
+        for(const L of sortedLevels){
+          const edgesAtLevel = levels.get(L);
+          await Promise.all(edgesAtLevel.map(edgeNodes => animateEdge(edgeNodes, 1200)));
+          await new Promise(r => setTimeout(r, 120));
+        }
+      } finally {
+        animateBtn.disabled = false;
+        statusEl.textContent = "";
+      }
+    }
+
+    // ---------- record video (MediaRecorder + optional Region Crop) ----------
+    async function recordVideo(){
+      if(!__segmentData){
+        showError("Generate the diagram first, then click Save Video.");
+        return;
+      }
+      try{
+        recordBtn.disabled = true;
+        animateBtn.disabled = true;
+        statusEl.textContent = "Prepare recording…";
+
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: 60 },
+          audio: false
+        });
+
+        // Try to crop captured region to chart panel
+        const chartPanel = document.getElementById('chart-panel');
+        const [track] = stream.getVideoTracks();
+        if (track && 'cropTo' in track && 'CropTarget' in window && chartPanel) {
+          try {
+            const target = await window.CropTarget.fromElement(chartPanel);
+            await track.cropTo(target);
+          } catch(e) { /* ignore if unsupported */ }
+        }
+
+        const mimeCandidates = ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+        const mimeType = mimeCandidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
+        const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+        const chunks = [];
+        recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = `workflow_${Date.now()}.webm`;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+          stream.getTracks().forEach(t => t.stop());
+          statusEl.textContent = "";
+          recordBtn.disabled = false;
+          animateBtn.disabled = false;
+        };
+
+        recorder.start(100);
+        statusEl.textContent = "Recording… Share this tab, then watch the animation.";
+
+        // Give the recorder a brief moment, then run the logical animation
+        await new Promise(r => setTimeout(r, 250));
+        await animateChart();
+
+        recorder.stop();
+      } catch(err){
+        console.error(err);
+        showError("Recording failed or was canceled.");
+        statusEl.textContent = "";
+        recordBtn.disabled = false;
+        animateBtn.disabled = false;
+      }
+    }
+
+    // ---------- generate ----------
     async function generate(){
       try{
         setBusy(true);
@@ -300,6 +570,8 @@ ${(d.incoming||[]).length} incoming`));
     }
 
     generateBtn.addEventListener("click", generate);
+    animateBtn.addEventListener("click", animateChart);
+    recordBtn .addEventListener("click", recordVideo);
     document.addEventListener("keydown", (e)=>{ if((e.ctrlKey||e.metaKey)&&e.key==="Enter") generate(); });
   </script>
 </body>
