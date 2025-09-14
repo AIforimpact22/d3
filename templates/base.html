@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Prompt → Workflow Diagram (D3)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <style>
+    :root { --bg:#0b0b0b; --card:#121212; --ink:#eaeaea; --muted:#9aa0a6; --radius:14px; }
+    *{box-sizing:border-box} html,body{height:100%}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+    header{padding:16px 22px;border-bottom:1px solid #1f1f1f;display:flex;align-items:center;justify-content:space-between;background:linear-gradient(180deg,#111,#0d0d0d);position:sticky;top:0;z-index:2}
+    header .title{font-weight:700} header .model{font-size:12px;color:var(--muted)}
+    main{padding:18px 22px 40px;display:grid;grid-template-columns:480px minmax(0,1fr);gap:18px}
+    .panel{background:var(--card);border:1px solid #1f1f1f;border-radius:var(--radius);padding:16px}
+    .panel h2{margin:0 0 10px;font-size:16px}
+    textarea{width:100%;min-height:240px;resize:vertical;border-radius:10px;padding:12px;background:#101010;color:var(--ink);border:1px solid #232323;line-height:1.4}
+    .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px}
+    .hint{color:var(--muted);font-size:12px}
+    button,.btn{appearance:none;cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;background:#141414;color:var(--ink);padding:10px 12px;font-weight:600}
+    button:hover{border-color:#3a3a3a}
+    fieldset{border:1px solid #242424;border-radius:10px;padding:8px 10px}
+    legend{padding:0 6px;color:var(--muted);font-size:12px}
+    label{display:inline-flex;align-items:center;gap:6px;margin-right:10px;font-size:13px;color:var(--muted)}
+    #error{display:none;margin-top:10px;color:#ff9b9b;background:#2a0d0d;border:1px solid #4d1a1a;padding:10px 12px;border-radius:10px;font-size:14px}
+    #chart-panel{overflow:auto} #chart{display:flex;align-items:center;justify-content:center;min-height:420px}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">Prompt → Workflow Diagram (Hierarchical Edge Bundling)</div>
+    <div class="model">Model: {{ model_name }} {% if ai_available %}(AI available){% else %}(Local only){% endif %}</div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Describe your process</h2>
+      <div id="error"></div>
+      <textarea id="prompt" placeholder="Example:
+Keep SQL inventory updated, stream real-time sales, analyze velocity, forecast demand, generate supplier POs, notify vendors, apply controls, and log/monitor. Use arrows like A -> B to force specific edges."></textarea>
+
+      <div class="row">
+        <fieldset>
+          <legend>Mode</legend>
+          <label><input type="radio" name="mode" value="local" checked> Local (no AI)</label>
+          <label><input type="radio" name="mode" value="ai" {% if not ai_available %}disabled{% endif %}> AI (Chat Completions)</label>
+        </fieldset>
+        <button id="generateBtn">Generate (Ctrl/Cmd+Enter)</button>
+        <a id="downloadSvg" class="btn" href="#" download="workflow.svg">Download SVG</a>
+        <span id="status" class="hint"></span>
+      </div>
+
+      <div class="hint" style="margin-top:8px">
+        The server turns your prompt into a flat array like:
+        <code>[{ "name": "method.input.PrepareData", "size": 800, "imports": [] }, ...]</code>
+      </div>
+    </section>
+
+    <section id="chart-panel" class="panel">
+      <h2>Diagram</h2>
+      <div id="chart" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script>
+    const chartHost = d3.select('#chart');
+    const errorBox = document.getElementById('error');
+    const generateBtn = document.getElementById('generateBtn');
+    const promptEl = document.getElementById('prompt');
+    const downloadSvg = document.getElementById('downloadSvg');
+    const statusEl = document.getElementById('status');
+
+    function showError(msg){ errorBox.style.display='block'; errorBox.textContent=msg; }
+    function clearError(){ errorBox.style.display='none'; errorBox.textContent=''; }
+    function setBusy(b){ generateBtn.disabled=b; statusEl.textContent=b ? "Generating…" : ""; }
+    function currentMode(){ const el=document.querySelector('input[name="mode"]:checked'); return el?el.value:'local'; }
+
+    // ---------- flat -> nested hierarchy ----------
+    function toHierarchyFromFlat(data, delimiter="."){
+      let root; const map=new Map();
+      data.forEach(function find(d){
+        const name=d.name;
+        if(map.has(name)) return map.get(name);
+        const i=name.lastIndexOf(delimiter);
+        map.set(name,d);
+        if(i>=0){
+          const parentName=name.substring(0,i);
+          const parent=find({name:parentName,children:[]});
+          (parent.children||(parent.children=[])).push(d);
+          d.name=name.substring(i+1);
+        } else { root=d; }
+        return d;
+      });
+      return root || {name:"method", children:[]};
+    }
+    function normalize(raw){
+      if(Array.isArray(raw)) return toHierarchyFromFlat(raw);
+      if(raw && typeof raw === 'object') return raw;
+      throw new Error("Expected array of nodes or nested object.");
+    }
+
+    // ---------- bundling helpers ----------
+    function id(node){ return `${node.parent ? id(node.parent)+'.' : ''}${node.data.name}`; }
+    function bilink(root){
+      const leaves=root.leaves();
+      const map=new Map(leaves.map(d=>[id(d),d]));
+      for(const d of leaves){
+        const imports=Array.isArray(d.data.imports)?d.data.imports:[];
+        d.incoming=[]; d.outgoing=imports.map(i=>map.get(i)).filter(Boolean).map(t=>[d,t]);
+      }
+      for(const d of leaves) for(const o of d.outgoing) o[1].incoming.push(o);
+      return root;
+    }
+    class Path{ constructor(_){this._=_;this._m=undefined;} moveTo(x,y){this._=[];this._m=[x,y];}
+      lineTo(x,y){this._.push(new Line(this._m,this._m=[x,y]));}
+      bezierCurveTo(ax,ay,bx,by,x,y){this._.push(new BezierCurve(this._m,[ax,ay],[bx,by],this._m=[x,y]));}
+      *split(k=0){const n=this._.length,i=Math.floor(n/2),j=Math.ceil(n/2);const a=new Path(this._.slice(0,i)),b=new Path(this._.slice(j));
+        if(i!==j){const[ab,ba]=this._[i].split();a._.push(ab);b._.unshift(ba);} if(k>1){yield* a.split(k-1);yield* b.split(k-1);} else{yield a;yield b;}}
+      toString(){return this._.join("");}}
+    class Line{constructor(a,b){this.a=a;this.b=b;} split(){const{a,b}=this;const m=[(a[0]+b[0])/2,(a[1]+b[1])/2];return[new Line(a,m),new Line(m,b)];} toString(){return`M${this.a}L${this.b}`;}}
+    const BezierCurve=(()=>{const l1=[4/8,4/8,0/8,0/8],l2=[2/8,4/8,2/8,0/8],l3=[1/8,3/8,3/8,1/8],r1=[0/8,2/8,4/8,2/8],r2=[0/8,0/8,4/8,4/8];
+      function dot([ka,kb,kc,kd],{a,b,c,d}){return[ka*a[0]+kb*b[0]+kc*c[0]+kd*d[0],ka*a[1]+kb*b[1]+kc*c[1]+kd*d[1]];}
+      return class BezierCurve{constructor(a,b,c,d){this.a=a;this.b=b;this.c=c;this.d=d;}
+        split(){const m=dot(l3,this);return[new BezierCurve(this.a,dot(l1,this),dot(l2,this),m),new BezierCurve(m,dot(r1,this),dot(r2,this),this.d)];}
+        toString(){return`M${this.a}C${this.b},${this.c},${this.d}`;};};})();
+
+    // ---------- color utilities ----------
+    const RED   = "#F50202";
+    const BLUE  = "#60a5fa";
+    const WHITE = "#D1D1D1";
+    const lerp  = d3.interpolateRgb.gamma(2.2);
+    const r2w = lerp(RED,  WHITE);
+    const w2b = lerp(WHITE, BLUE);
+    const b2w = lerp(BLUE, WHITE);
+    const w2r = lerp(WHITE, RED);
+
+    function nodeRole(leaf){
+      const out=(leaf.outgoing||[]).length, inc=(leaf.incoming||[]).length;
+      if(out > inc) return "start";     // red at source
+      if(inc > out) return "end";       // blue at source
+      return "start";                   // tie -> start
+    }
+
+    // Color ramp with **equal thirds by length** for each path
+    function rampColorEqualThirds(u, orient){
+      // u in [0,1] is the normalized **geometric** position along the edge
+      if(orient === "r2b"){            // red → white → blue
+        if(u < 1/3)   return r2w(u * 3);           // 0..1/3 red→white
+        if(u < 2/3)   return WHITE;                 // 1/3..2/3 pure white
+        return w2b((u - 2/3) * 3);                  // 2/3..1 white→blue
+      } else {                          // blue → white → red
+        if(u < 1/3)   return b2w(u * 3);           // 0..1/3 blue→white
+        if(u < 2/3)   return WHITE;                 // 1/3..2/3 pure white
+        return w2r((u - 2/3) * 3);                  // 2/3..1 white→red
+      }
+    }
+
+    // --- geometry helpers to get **length-weighted** color positions ---
+    function dist(a,b){ const dx=a[0]-b[0], dy=a[1]-b[1]; return Math.hypot(dx,dy); }
+    function bezierPoint(curve, t){
+      const a=curve.a, b=curve.b, c=curve.c, d=curve.d;
+      const mt=1-t;
+      const x = mt*mt*mt*a[0] + 3*mt*mt*t*b[0] + 3*mt*t*t*c[0] + t*t*t*d[0];
+      const y = mt*mt*mt*a[1] + 3*mt*mt*t*b[1] + 3*mt*t*t*c[1] + t*t*t*d[1];
+      return [x,y];
+    }
+    function bezierLength(curve, samples=12){
+      let len=0, prev=curve.a;
+      for(let i=1;i<=samples;i++){
+        const t=i/samples;
+        const p=bezierPoint(curve,t);
+        len += dist(prev,p);
+        prev=p;
+      }
+      return len;
+    }
+    function pathLength(path){
+      // path._ is an array of primitives: Line or BezierCurve
+      return path._.reduce((acc, seg) => {
+        if (seg instanceof Line) return acc + dist(seg.a, seg.b);
+        // Bezier approximation
+        return acc + bezierLength(seg);
+      }, 0);
+    }
+
+    // ---------- render chart ----------
+    function renderChart(raw){
+      try{
+        clearError(); chartHost.selectAll("*").remove();
+
+        const data = normalize(raw);
+        const width=900, radius=width/2.5, k=6; // split depth
+
+        const tree=d3.cluster().size([2*Math.PI, radius-100]);
+        const root=tree(bilink(d3.hierarchy(data).sort((a,b)=>
+          d3.ascending(a.height,b.height) || d3.ascending(a.data.name,b.data.name)
+        )));
+
+        const svg=d3.create("svg")
+          .attr("width",width).attr("height",width)
+          .attr("viewBox",[-width/2,-width/2,width,width])
+          .attr("style","max-width:100%; height:auto; font:16px sans-serif;");
+
+        // Background
+        svg.append("rect")
+          .attr("x",-width/2).attr("y",-width/2)
+          .attr("width",width).attr("height",width)
+          .attr("fill","black");
+
+        // Labels
+        svg.append("g").selectAll()
+          .data(root.leaves()).join("g")
+          .attr("transform", d => `rotate(${d.x*180/Math.PI - 90}) translate(${d.y},0)`)
+          .append("text")
+            .attr("dy","0.31em")
+            .attr("x", d => d.x < Math.PI ? 6 : -6)
+            .attr("text-anchor", d => d.x < Math.PI ? "start" : "end")
+            .attr("transform", d => d.x >= Math.PI ? "rotate(180)" : null)
+            .attr("fill","white")
+            .text(d => d.data.name)
+            .call(text => text.append("title").text(d => `${id(d)}
+${(d.outgoing||[]).length} outgoing
+${(d.incoming||[]).length} incoming`));
+
+        const line=d3.lineRadial().curve(d3.curveBundle).radius(d=>d.y).angle(d=>d.x);
+        const toPath=([source,target])=>{const p=new Path; line.context(p)(source.path(target)); return p;};
+
+        // Build per-edge segments; color by **geometric position** along the path
+        const segmentData = [];
+        root.leaves().forEach(srcLeaf => {
+          (srcLeaf.outgoing || []).forEach(pair => {
+            const [src, dst] = pair;
+            const orient = (nodeRole(src) === "start") ? "r2b" : "b2r";
+            const p = toPath([src, dst]);
+
+            // Split into many small segments and compute cumulative length
+            const segs = Array.from(p.split(k));  // 2^k small chunks
+            const lengths = segs.map(s => pathLength(s));
+            const total = lengths.reduce((a,b)=>a+b, 0) || 1;
+            let cumulative = 0;
+
+            for (let j = 0; j < segs.length; j++) {
+              const segLen = lengths[j];
+              // use the segment's midpoint position along the whole path
+              const mid = (cumulative + segLen / 2) / total;   // u in [0,1]
+              cumulative += segLen;
+              segmentData.push({ seg: segs[j], u: mid, orient });
+            }
+          });
+        });
+
+        svg.append("g").attr("fill","none").selectAll("path")
+          .data(segmentData)
+          .join("path")
+            .attr("stroke", d => rampColorEqualThirds(d.u, d.orient))
+            .attr("stroke-width", 2)           <!-- thicker line -->
+            .attr("stroke-linecap", "round")
+            .attr("stroke-linejoin", "round")
+            .attr("d", d => d.seg.toString());
+
+        // Brand (bottom-right)
+        const brand = svg.append("g").attr("transform", `translate(${width/2 - 150}, ${width/2 - 40})`);
+        brand.append("image").attr("href","{{ brand_logo_url }}").attr("width",30).attr("height",30).attr("y",-20);
+        brand.append("text").attr("x",40).attr("y",-5).attr("fill","white").style("font-weight","bold").text("{{ brand_name }}");
+        brand.append("text").attr("x",40).attr("y",15).attr("fill","white").style("font-size","12px").text("{{ brand_site }}");
+
+        chartHost.node().appendChild(svg.node());
+
+        // Download SVG
+        const serializer=new XMLSerializer();
+        const svgString=serializer.serializeToString(svg.node());
+        const blob=new Blob([svgString],{type:"image/svg+xml;charset=utf-8"});
+        const url=URL.createObjectURL(blob);
+        downloadSvg.href=url;
+      } catch(err){
+        console.error(err); showError(err.message || "Render error.");
+      }
+    }
+
+    async function generate(){
+      try{
+        setBusy(true);
+        const prompt = promptEl.value.trim();
+        if(!prompt){ showError("Write a prompt first."); setBusy(false); return; }
+        const mode = currentMode();
+        const res = await fetch("/api/generate", {
+          method:"POST",
+          headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({ prompt, mode })
+        });
+        const data = await res.json();
+        if(!res.ok) throw new Error(data.error || "Failed to generate.");
+        if(!Array.isArray(data.nodes)) throw new Error("Server did not return nodes[].");
+        renderChart(data.nodes);
+      } catch(err){
+        console.error(err); showError(err.message || "Unexpected error.");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    generateBtn.addEventListener("click", generate);
+    document.addEventListener("keydown", (e)=>{ if((e.ctrlKey||e.metaKey)&&e.key==="Enter") generate(); });
+  </script>
+</body>
+</html>
